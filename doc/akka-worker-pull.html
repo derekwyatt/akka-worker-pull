@@ -1,0 +1,318 @@
+<html>
+  <head>
+    <style type="text/css">
+      body
+      {
+        font-family: "Helvetica Neue";
+        width: 510px;
+        font-size: 14px;
+      }
+    </style>
+  </head>
+<body>
+<h2>Balancing Workload Across Nodes with Akka 2</h2>
+<p>In Akka 2, there is a nifty little thing called the <a
+  href="http://doc.akka.io/docs/akka/snapshot/scala/dispatchers.html#Types_of_dispatchers">BalancingDispatcher</a>,
+which will magically distribute work to a collection of Actors in the most
+efficient way possible (i.e. it's a <i>work stealing</i> dispatcher).  The <a
+  href="http://doc.akka.io/docs/akka/snapshot/scala/routing.html#SmallestMailboxRouter">SmallestMailboxRouter</a>
+has this kind of feel as well.  However, the <code>BalancingDispatcher</code>
+and the <code>SmallestMailboxRouter</code> differ in how the choice is made
+about who, and when to deliver the incoming message.  The
+<code>BalancingDispatcher</code> dispatches a message to an Actor only when that
+Actor would otherwise be idle. The <code>SmallestMailboxRouter</code> dispatches
+the message to the Actor with the least number of messages in its Mailbox even
+while the Actor is currently working on other things.</p>
+
+<p>Often times, people want the functionality of the
+<code>BalancingDispatcher</code> with the stipulation that the Actors doing the
+work have distinct Mailboxes on remote nodes.  In this post we'll explore the
+implementation of such a concept.</p>
+
+<p>I'm going to assume you understand Akka to a reasonably competent level.
+Most people don't get to the point of asking how to do something like this
+without understanding a fair bit about Akka in the first place, so I'm going to
+pretend that my assumption is reasonable. :)</p>
+
+<h3>The <code>BalancingDispatcher</code></h3>
+<p>First, take a quick look at the <code>BalancingDispatcher</code>.
+Essentially, it works by sharing a single Mailbox amongst all of its Actors.  It
+doesn't really "steal" work from its Actors; it just intelligently distributes
+that work by ensuring that the next message gets sent to an idle Actor, and if
+one isn't available, then the message doesn't get sent until that changes.</p>
+
+<div style="text-align: center;">
+  <!--<img src="BalancingDispatcher.png"/>-->
+  <img src="http://www.derekwyatt.org/wp-content/uploads/2012/08/BalancingDispatcher.png"/>
+  <div style="padding: 0.5em 30px 0.5em 30px; font-size: 80%; text-align: left;">
+    <b>Fig 1</b>: The <code>BalancingDispatcher</code> distributes work to Actors evenly by
+    having them all share the same Mailbox.
+  </div>
+</div>
+
+<h3>The <code>SmallestMailboxRouter</code></h3>
+<p>The <code>SmallestMailboxRouter</code> differs because the Actors to which it
+routes all have distinct Mailboxes.  So, while the
+<code>BalancingDispatcher</code> makes its decision on which Actor gets the
+message at message <i>processing</i> time, the
+<code>SmallestMailboxRouter</code> makes its decision on which Actor gets the
+message at message <i>delivery</i> time.</p>
+
+<div style="text-align: center;">
+  <!--<img src="SmallestMailboxRouter.png" style="text-align: center;"/>-->
+  <img src="http://www.derekwyatt.org/wp-content/uploads/2012/08/SmallestMailboxRouter.png" style="text-align: center;"/>
+  <div style="padding: 0.5em 30px 0.5em 30px; font-size: 80%; text-align: left;">
+    <b>Fig 2</b>: The <code>SmallestMailboxRouter</code> sends messages to Actors immediately,
+    regardless as to how much time they may send working on their messages in the
+    future.  The key is that it sends the message to the Actor with the smallest
+    Mailbox.
+  </div>
+</div>
+
+<h2>The Goal</h2>
+<p>We're going to rely on two key components: the <i>Master</i> and
+<i>Worker</i>.  The Master will help coordinate the work and the Worker will
+execute on that work.  The qualities of the pattern are as follows:</p>
+
+<ol>
+<li>Implement the fundamental concept of the <code>BalancingDispatcher</code> -
+that which distributes work only to those that can work on it immediately -
+while still having distinct Mailboxes per Worker.
+<ul>
+  <li>We must have distinct Mailboxes per Worker since the Workers are on remote
+  nodes and if they didn't have Mailboxes then there would be nowhere to deliver
+  their messages.</li>
+</ul>
+</li>
+<li>Preserve the original sender of the work.  This allows the Worker to respond
+to the original sender when the work is complete.</li>
+<li>Provide a mechanism for the Master to detect death of a Worker and reassign
+the work if need be.</li>
+<li>Allow the capacity of the system to increase by the addition of Workers
+dynamically.</li>
+</ol>
+
+<h3>The Pattern Overview</h3>
+<p>In order to deliver on our goal we are going to invert the work-sending
+paradigm of the <code>BalancingDispatcher</code>.  The Master will not
+<i>push</i> work to the Workers; instead, the Workers will <i>pull</i> that work
+from the Master on-demand.  There are a number of advantages to inverting this
+message flow, as we'll see.</p>
+
+<div style="text-align: center;">
+  <!--<img src="FullSpread.png"/>-->
+  <img src="http://www.derekwyatt.org/wp-content/uploads/2012/08/FullSpread.png"/>
+  <div style="padding: 0.5em 30px 0.5em 30px; font-size: 80%; text-align: left;">
+    <b>Fig 3</b>: Ultimately this is what we're going to achieve.  The Master
+    distributes work to Workers only when Workers request it.  The Workers will
+    inform the Master that they're finished their work, but the Master will not
+    push work their way until they make another request.
+  </div>
+</div>
+
+<p>One of the key points to remember about this pattern is that it's entirely
+event driven with no polling.  Message number 2 might make it look like there is
+polling, but you can rest assured that it isn't - message number 2 is sent as
+the result of a previous event, not a timer.</p>
+
+<h2>The Master and its Workers</h2>
+<p>In order for the pattern to be valid we must have concrete instances of
+the Master (on some node) and the Workers (on the same node, or other nodes).
+The relationship between the two is key: Workers identify themselves to the
+Master - the Master doesn't spawn Workers.  A variant on this pattern would be
+to have the Master do exactly that, but this definition does not include that
+notion.</p>
+
+<p>The caveat, therefore, is that the Master must be running before the Workers
+try to register with it, and the Workers must be aware of the Master's
+location.  Another variant could use failure / retry handling in the Workers to
+ease the need for this startup ordering, but that's a detail we're not concerned
+with here.</p>
+
+<div style="text-align: center;">
+  <!--<img src="WorkStealingAdvertise.png"/>-->
+  <img src="http://www.derekwyatt.org/wp-content/uploads/2012/08/WorkStealingAdvertise.png"/>
+  <div style="padding: 0.5em 30px 0.5em 30px; font-size: 80%; text-align: left;">
+    <b>Fig 4</b>: The Master only learns of the existence of the Workers when
+    they advertise themselves.
+  </div>
+</div>
+
+<p>This constraint opens up the flexibility of the system:</p>
+
+<ul>
+<li>There's no clunky configuration of the Master required.  We don't need to
+"reconfigure it" every time we want to add a new Worker.</li>
+<li>You can increase capacity dynamically.  If you need more Workers, just
+instantiate them and they'll get work assigned to them as soon as it becomes
+available.</li>
+</ul>
+
+<p>This is essentially how <a href="http://hadoop.apache.org">Hadoop</a>'s
+MapReduce system works, and it's the same way many systems before it have worked
+as well.</p>
+
+<h2>The Master</h2>
+<p>Now that we know what the pattern looks like we can describe the operation of
+the Master.  For the most part, our Master will take on the role of the
+<code>BalancingDispatcher</code>'s single Mailbox.  It will collect up work to
+be done, and distribute it as required amongst the Workers, but only at the
+moment when those Workers can actually work on it.</p>
+
+<div style="text-align: center;">
+  <!--<img src="WorkStealing.png"/>-->
+  <img src="http://www.derekwyatt.org/wp-content/uploads/2012/08/WorkStealing.png"/>
+  <div style="padding: 0.5em 30px 0.5em 30px; font-size: 80%; text-align: left;">
+    <b>Fig 5</b>: The Master sends work to Workers only when they ask for it.
+    Workers are not polling for work - they ask for it when they're finished
+    doing their current job, or they've been told that pending work is
+    available.
+  </div>
+</div>
+
+<p>Above we see that "Worker 3" is in a position to ask for work, while the
+others are busy.  The Master will give that work out to "Worker 3" and hold on
+to the rest, waiting until another Worker (or it may actually end up being
+"Worker 3" again) asks for work.</p>
+
+<h3>The Protocol</h3>
+<p>We start with the message protocol that passes between the Master and its
+Workers.  The following defines both messages sent to and messages sent from the
+Master.</p>
+
+<script src="https://gist.github.com/3288134.js?file=MasterProtocol.scala"></script>
+
+<h3>The Master Code</h3>
+<p>Next we see the master code.  Its job is to queue work sent to it from the
+outside world, and handle the three messages that can be sent from the Workers.
+It also puts Deathwatch on the Workers in order to take action should any of
+those Workers croak.</p>
+
+<script src="https://gist.github.com/3288146.js?file=Master.scala"></script>
+
+<h2>The Worker</h2>
+<p>The Worker's job is to switch between two states: <i>idle</i> and
+<i>working</i>.  When it's idle, it's looking for work and when it's working
+it's trying to go idle.  The Worker responds to messages differently depending
+on what state it's currently in.</p>
+
+<p>We implement the Worker as an abstract base class, from which you would
+derive and implement the <code>doWork()</code> method.  It's intended that this
+<code>doWork()</code> method do its job asynchronously but that's not a
+requirement.  However, given how simple it is to spawn of work in a Future with
+Akka, why wouldn't you?</p>
+
+<script src="https://gist.github.com/3288156.js?file=Worker.scala"></script>
+
+<h3>Implementing a Worker</h3>
+<p>In order to use the Worker, we need to create a derivation.  For the purposes
+of this example, and testing, we're going to create a Worker that sends a string
+to the original work requester.</p>
+
+<script src="https://gist.github.com/3288187.js?file=TestWorker.scala"></script>
+
+<p>Note how we've spawned the work off into its own Future that will execute
+asynchronously.  When it's complete it will inform the Worker of that fact using
+the WorkComplete message.</p>
+
+<div style="text-align: center;">
+  <!--<img src="WorkStealing.png"/>-->
+  <img src="http://www.derekwyatt.org/wp-content/uploads/2012/08/FutureSpawn.png"/>
+  <div style="padding: 0.5em 30px 0.5em 30px; font-size: 80%; text-align: left;">
+    <b>Fig 6</b>: This is really how you should implement your
+    <code>doWork()</code> method.  Send the work off to the future, which will
+    allow your Worker to remain responsive to the Master.
+  </div>
+</div>
+
+<h3>Testing</h3>
+<p>And we now verify that everything works by implementing a test.</p>
+
+<script src="https://gist.github.com/3288247.js?file=TestWorkerTest.scala"></script>
+
+<h3>Possible Extensions / Modifications</h3>
+<p>What's been presented is merely a pattern as instruction on the mechanism for
+achieving a <code>BalancingDispatcher</code>-style work distribution system
+across multiple nodes.  There are a number of variants you could make of this
+pattern.</p>
+
+<ul>
+<li>Forget the whole "idle" thing.  When a Worker sees that there's no more work
+to be done, it can stop itself (i.e. <code>context.stop(self)</code>).  Given
+the current implementation, the Master would detect this and remove it from the
+list of possible candidates.</li>
+<li>Remove the side-effects.  Have a tighter relationship between the Master and
+its Workers; the Worker pulls work from the Master and actually returns results
+back to the Master.  Personally I can't see a reason to do this.</li>
+<li>Have the Master spawn the children as needed.  This would create them as
+direct children, which is certainly different than what we have here but if
+that's what you want to do then do it.  The <i>pull</i> semantics don't change,
+however.  You still pull - you just create the Worker as part of the Master
+logic.</li>
+<li>Any retry-logic that you might want would have to live in the Master, but
+idempotency and retry are way beyond the scope of this article.  You can
+implement retry in the Master and / or dovetail this concept into the <a
+  href="http://doc.akka.io/docs/akka/snapshot/cluster/cluster.html">Clustering</a>
+features that are coming up in the 2.x stream of Akka.</li>
+<li>If you're smart, and implement <code>doWork()</code> in the future, then you
+can have the Worker be responsive to the Master's requests for status (for
+example).</li>
+</ul>
+
+<h3>Usage Example</h3>
+<p>Let's take a different look at how you might use this, just to illustrate
+that it's still a very general implementation.  If you want to download a ton of
+pages in parallel across a huge farm of nodes, collect them up, and then dump
+them to third party (say, a page renderer) when they're all in... <i>piece of
+cake</i>.</p>
+
+<script src="https://gist.github.com/3288756.js?file=FutureSequence.scala"></script>
+
+<h3>Conclusion</h3>
+<p>The key to this pattern isn't the implementation or anything fancy. What's
+important is the inversion of what, for some, is their natural inclination.
+When people think of an on-demand, event-based system, they think <i>push</i>,
+but push doesn't work here.  You can't push to an Actor unless you know it will
+be available to do your work, and since you can't peek into its Mailbox, you're
+not going to be able to find out.</p>
+
+<p>Alternatively you might think of implementing a model where the Master can
+ask the Worker what it's doing and push work it's way when it says it's idle.
+This is a bad idea for a couple of reasons.</p>
+
+<ol>
+  <li>What if the Worker says "I'm busy, leave me alone"?  When can the Master
+  ask again?</li>
+  <ul>
+    <li>It's starting to look like polling, and polling is going to slow things
+    down a lot.</li>
+  </ul>
+  <li>What if the Worker says "I'm idle", but one millisecond later it becomes
+  busy?</li>
+  <ul>
+    <li>The Master will send it work to do, and it won't do that work for
+    (possibly) a very long time.</li>
+  </ul>
+</ol>
+
+<p>You can try to work around those issues by setting up some sort of
+transactional nature between the Master and the Worker - something like, "If
+you're not busy, tell me you won't do anything else until I send you something".
+But why?  Invert from push to pull, and none of these problems exist.  With
+pull, you could even have a single Worker service many Masters without conflict,
+should you choose to do so.</p>
+
+<p>The bones of this pattern should give you highly reactive, fast, and
+efficient use of your Workers across multiple nodes.  Implement and alter to
+suit your needs, and then collect your profit!</p>
+
+<h3>About the Author</h3>
+<p><a href="http://www.derekwyatt.org">Derek Wyatt</a> is a Software Developer
+and Architect at <a href="http://www.primal.com">Primal</a>, helping to create
+Interest Networks using graphs and other cool stuff.  He is also the author of
+an upcoming book on Akka to be published by <a
+  href="http://www.artima.com">Artima Publishing</a>.  You should go get a copy
+when it comes out... really.  <i>It'll have pictures!</i> <span
+  style="font-size: 60%;">Nothing dirty, though...</span></p>
+</body>
+</html>
